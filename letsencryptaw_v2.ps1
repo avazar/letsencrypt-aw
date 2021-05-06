@@ -22,13 +22,18 @@
 #      - Migrated to Az modules.
 #        Following modules are needed now: Az.Accounts, Az.Network, Az.Storage
 #
+#      UPDATE 2021-06-05
+#      - Added second domain (can be used e.g. to add wildcard domain).
+#      - Used DNS challenge instead of HTTP
+#
 #######################################################################################
 
 Param(
-    [string]$domain,
+    [string]$domain1,
+    [string]$domain2,
     [string]$EmailAddress,
-    [string]$STResourceGroupName,
-    [string]$storageName,
+    [string]$dnsResourceGroupName,
+    [string]$dnsName,
     [string]$AGResourceGroupName,
     [string]$AGName,
     [string]$AGOldCertName
@@ -64,41 +69,54 @@ $state = Get-ACMEState -Path $env:TEMP;
 New-ACMENonce $state -PassThru;
 
 # Create the identifier for the DNS name
-$identifier = New-ACMEIdentifier $domain;
+
+$identifier = @($domain1, $domain2);
 
 # Create the order object at the ACME service.
 $order = New-ACMEOrder $state -Identifiers $identifier;
 
 # Fetch the authorizations for that order
-$authZ = Get-ACMEAuthorization -State $state -Order $order;
+$authorizations = @(Get-ACMEAuthorization -State $state -Order $order);
 
-# Select a challenge to fullfill
-$challenge = Get-ACMEChallenge $state $authZ "http-01";
+$Records = @()
+$Challenges = @()
 
-# Inspect the challenge data
-$challenge.Data;
+foreach($authz in $authorizations) {
 
-# Create the file requested by the challenge
-$fileName = $env:TMP + '\' + $challenge.Token;
-Set-Content -Path $fileName -Value $challenge.Data.Content -NoNewline;
+    # Select a challenge to fullfill
+    $challenge = Get-ACMEChallenge -State $state -Authorization $authz -Type "dns-01";
 
-$blobName = ".well-known/acme-challenge/" + $challenge.Token
-$storageAccount = Get-AzStorageAccount -ResourceGroupName $STResourceGroupName -Name $storageName
-$ctx = $storageAccount.Context
-Set-AzStorageBlobContent -File $fileName -Container "public" -Context $ctx -Blob $blobName
+    $Challenges += $challenge;
+    $Records += New-AzDnsRecordConfig -Value $challenge.Data.Content;
+    
+    $res = ConvertTo-Json $challenge
+    Write-Warning $res
 
-# Signal the ACME server that the challenge is ready
-$challenge | Complete-ACMEChallenge $state;
+}
+
+# Add DNS record
+New-AzDnsRecordSet -Overwrite -Name "_acme-challenge" -RecordType TXT -ZoneName $dnsName -ResourceGroupName $dnsResourceGroupName -Ttl 3600 -DnsRecords $Records
+
+# Signal the ACME server that the challenges are ready
+foreach($ch in $Challenges) {
+    $ch | Complete-ACMEChallenge $state;
+}
 
 # Wait a little bit and update the order, until we see the states
 while($order.Status -notin ("ready","invalid")) {
     Start-Sleep -Seconds 10;
     $order | Update-ACMEOrder $state -PassThru;
+    $res = ConvertTo-Json $order
+    Write-Warning $res
+}
+
+if($order.Status -eq "invalid") {
+    throw "Your order has been marked as invalid - certificate cannot be issued."
 }
 
 # We should have a valid order now and should be able to complete it
 # Therefore we need a certificate key
-$certKey = New-ACMECertificateKey -Path "$env:TEMP\$domain.key.xml";
+$certKey = New-ACMECertificateKey -Path "$env:TEMP\$dnsName.key.xml";
 
 # Complete the order - this will issue a certificate singing request
 Complete-ACMEOrder $state -Order $order -CertificateKey $certKey;
@@ -110,13 +128,16 @@ while(-not $order.CertificateUrl) {
 }
 
 # As soon as the url shows up we can create the PFX
-$password = ConvertTo-SecureString -String "Passw@rd123***" -Force -AsPlainText
-Export-ACMECertificate $state -Order $order -CertificateKey $certKey -Path "$env:TEMP\$domain.pfx" -Password $password;
+$password = ConvertTo-SecureString -String "password" -Force -AsPlainText
+Export-ACMECertificate $state -Order $order -CertificateKey $certKey -Path "$env:TEMP\$dnsName.pfx" -Password $password;
 
-# Delete blob to check DNS
-Remove-AzStorageBlob -Container "public" -Context $ctx -Blob $blobName
+# Delete dns record to check DNS
+$RecordSet = Get-AzDnsRecordSet -Name "_acme-challenge" -RecordType TXT -ResourceGroupName $dnsResourceGroupName -ZoneName $dnsName
+Remove-AzDnsRecordSet -RecordSet $RecordSet
 
 ### RENEW APPLICATION GATEWAY CERTIFICATE ###
 $appgw = Get-AzApplicationGateway -ResourceGroupName $AGResourceGroupName -Name $AGName
 Set-AzApplicationGatewaySSLCertificate -Name $AGOldCertName -ApplicationGateway $appgw -CertificateFile "$env:TEMP\$domain.pfx" -Password $password
 Set-AzApplicationGateway -ApplicationGateway $appgw
+
+
